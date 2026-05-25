@@ -1,0 +1,718 @@
+# Cord Protocol SDK
+
+> Post-quantum cryptographic identity for AI agents.
+> npm: @cordprotocol/sdk | https://cordprotocol.dev
+
+---
+
+## Overview
+
+Cord Protocol is an open-source TypeScript SDK that issues signed, verifiable
+identity credentials to AI agents. The credential encodes who the agent is, who
+authorized it, what it may do (a permission scope list), and when that authorization
+expires — all covered by a single cryptographic signature. Any service the agent
+calls can verify the credential locally in milliseconds with no issuer server call.
+Tampering with any field — including the permission list or expiry timestamp —
+breaks the signature immediately.
+
+**Philosophy:** Authorization for autonomous AI should be explicit, scoped,
+time-limited, and cryptographically provable. Implicit trust or API keys with
+unlimited scope are not adequate for agents that place orders, send email, or
+spend money.
+
+---
+
+## The Problems Cord Solves
+
+### Non-human identity gap
+OAuth 2.0 and OIDC are designed for human users completing a browser-based login
+flow. AI agents operate without user interaction. They have no session cookie, no
+redirect URI, and no browser. Standard enterprise auth has no primitive for
+"autonomous software acting on behalf of an organization."
+
+### Prompt injection and impersonation
+An agent that presents an API key and claims to be authorized provides no proof
+of what it is authorized to do. A Cord credential is a signed JSON document: the
+issuer's public key is embedded in the payload and the Ed25519 signature covers
+every field. An attacker cannot escalate permissions or extend expiry — any
+modification invalidates the signature.
+
+### Blast radius of compromised agents
+Without scoped, time-limited credentials, a compromised or misbehaving agent
+has unbounded access for as long as its API key is valid. Cord credentials carry
+an explicit permission list and a mandatory expiry (default 24h). A stolen
+credential is bounded in both scope and time.
+
+---
+
+## Installation
+
+```bash
+npm install @cordprotocol/sdk
+```
+
+**Requirements:** Node.js ≥ 18.0.0, TypeScript ≥ 5.0 (if using TypeScript).
+
+---
+
+## TypeScript Types
+
+```typescript
+// Core credential — a fully signed agent identity document
+interface AgentCredential {
+  id: string;              // UUID v4 — unique credential identifier
+  agentId: string;         // caller-defined agent identifier
+  issuedTo: string;        // owner/operator (person or organization name)
+  issuedAt: string;        // ISO 8601 — when this credential was created
+  expiresAt: string;       // ISO 8601 — after this the credential is invalid
+  permissions: string[];   // scope strings, e.g. ["read:data", "spend:500"]
+  attestationHash: string; // base64 SHA-256 of attestationData (or credential ID)
+  issuerPublicKey: string; // base64 Ed25519 public key of the signing authority
+  signature: string;       // base64 Ed25519 signature over all other fields
+}
+
+// Input parameters for issuing a credential
+interface IssueCredentialParams {
+  agentId: string;         // required — identifier for the agent
+  issuedTo: string;        // required — owner/operator name
+  permissions: string[];   // required — must be non-empty, each must match scope format
+  expiresIn?: string;      // optional — duration or ISO timestamp, default "24h"
+  attestationData?: string; // optional — arbitrary string hashed into attestationHash
+}
+
+// Return value from verifyCredential()
+interface VerificationResult {
+  valid: boolean;             // true only when schema, expiry, AND signature all pass
+  errors: string[];           // human-readable failure descriptions
+  credential?: AgentCredential; // present when the schema is structurally valid
+}
+
+// Key pair from generateKeyPair()
+interface KeyPair {
+  publicKey: Uint8Array;     // raw 32-byte Ed25519 public key
+  privateKey: Uint8Array;    // raw 32-byte Ed25519 private key — keep secret
+  publicKeyBase64: string;   // base64 — embedded in issued credentials
+  privateKeyBase64: string;  // base64 — used to sign credentials
+}
+```
+
+---
+
+## Complete API Reference
+
+### `generateKeyPair(): Promise<KeyPair>`
+
+Generates a new Ed25519 key pair using a cryptographically secure random number
+generator (`@noble/ed25519` under the hood). Call once per issuing authority;
+store the private key in a secrets manager.
+
+```typescript
+import { generateKeyPair } from '@cordprotocol/sdk';
+
+const keyPair = await generateKeyPair();
+console.log(keyPair.publicKeyBase64);   // embed in configs
+console.log(keyPair.privateKeyBase64);  // → secrets manager, never log
+```
+
+The post-quantum upgrade path: when CRYSTALS-Dilithium (ML-DSA / FIPS 204) reaches
+production-grade JS support, only `crypto/keys.ts` and `crypto/signatures.ts`
+change. The `KeyPair` interface and all callers remain identical.
+
+---
+
+### `issueCredential(params, privateKey): Promise<AgentCredential>`
+
+Creates and signs a credential. The payload is deterministically serialized
+(keys sorted alphabetically) before signing, ensuring identical output regardless
+of JS engine property ordering.
+
+```typescript
+import { issueCredential, SCOPES } from '@cordprotocol/sdk';
+
+const credential = await issueCredential(
+  {
+    agentId: 'order-bot-v2',
+    issuedTo: 'Acme Corp',
+    permissions: [
+      SCOPES.READ_DATA,
+      SCOPES.WRITE_ORDERS,
+      'spend:500',          // custom spend cap
+    ],
+    expiresIn: '8h',        // '30m' | '24h' | '7d' | '2w' | ISO 8601 timestamp
+    attestationData: JSON.stringify(agentConfig), // hash bound to this code version
+  },
+  keyPair.privateKeyBase64, // string | Uint8Array
+);
+```
+
+**`expiresIn` formats:**
+- Duration strings: `"30m"` (30 minutes), `"24h"` (24 hours), `"7d"` (7 days), `"2w"` (2 weeks)
+- ISO 8601 absolute timestamp: `"2025-12-31T23:59:59.000Z"`
+- Default when omitted: `"24h"`
+
+**`attestationData`:** An arbitrary string that is SHA-256 hashed and stored in
+`attestationHash`. Pass a JSON serialization of the agent's config or a checksum of
+its deployed code bundle. This creates a tamper-evident link between the credential
+and a specific agent version. If omitted, the credential's UUID is used instead
+(still unique, not code-bound).
+
+---
+
+### `verifyCredential(credentialOrBase64): Promise<VerificationResult>`
+
+Full verification: schema validity, expiry check, and cryptographic signature
+verification. No network call required — the issuer's public key is embedded in
+the credential.
+
+**Accepts:**
+- A parsed `AgentCredential` object
+- A base64-encoded JSON string (as produced by `Buffer.from(JSON.stringify(credential)).toString('base64')`)
+
+**Verification order:**
+1. Schema validation — all required fields present and correctly typed
+2. Expiry check — `expiresAt` must be in the future
+3. Signature verification — reconstructs the exact serialized payload and checks
+   the Ed25519 signature against `issuerPublicKey`
+
+All three checks must pass for `valid: true`. If any fail, `valid` is `false` and
+`errors` contains one entry per failure.
+
+```typescript
+import { verifyCredential } from '@cordprotocol/sdk';
+
+const result = await verifyCredential(base64Token);
+
+if (!result.valid) {
+  // result.errors: string[] — e.g.
+  // ['Credential expired at 2025-06-01T12:00:00.000Z']
+  // ['Signature verification failed — credential may have been tampered with']
+  throw new Error(result.errors.join('; '));
+}
+
+const agent = result.credential!; // AgentCredential — safe to read
+```
+
+---
+
+### `hasPermission(credential, scope): boolean`
+
+Returns `true` if `scope` is present in `credential.permissions`. Exact string
+match — no wildcard expansion. Always call after `verifyCredential` confirms the
+credential is valid.
+
+```typescript
+import { hasPermission, SCOPES } from '@cordprotocol/sdk';
+
+hasPermission(credential, SCOPES.WRITE_ORDERS)  // true or false
+hasPermission(credential, 'spend:500')           // true or false
+```
+
+---
+
+### `isExpired(credential): boolean`
+
+Checks only the `expiresAt` timestamp. Does not verify the signature. Useful for
+a fast pre-flight check before running `verifyCredential`.
+
+```typescript
+import { isExpired } from '@cordprotocol/sdk';
+
+if (isExpired(credential)) {
+  // credential.expiresAt is in the past
+}
+```
+
+---
+
+### `validateCredentialSchema(candidate): string[]`
+
+Validates the structure of an unknown value against the `AgentCredential` schema.
+Returns an array of error messages; an empty array means the schema is valid.
+Does not check expiry or signature. Useful for validating untrusted input before
+passing it to `verifyCredential`.
+
+```typescript
+import { validateCredentialSchema } from '@cordprotocol/sdk';
+
+const errors = validateCredentialSchema(unknownObject);
+if (errors.length > 0) {
+  // malformed credential
+}
+```
+
+---
+
+### `validateScopes(scopes): boolean`
+
+Returns `true` if every scope in the array is well-formed. Rejects empty arrays
+and any scope that doesn't match `<word>:<word_or_number>`.
+
+```typescript
+validateScopes(['read:data', 'spend:500'])  // true
+validateScopes(['READ:DATA'])               // false — uppercase not allowed
+validateScopes([])                          // false — empty array rejected
+```
+
+---
+
+### `parseSpendLimit(scope): number | null`
+
+Parses a spend scope and returns the numeric limit, or `null` if not a spend scope.
+
+```typescript
+parseSpendLimit('spend:500')   // 500
+parseSpendLimit('spend:99.99') // 99.99
+parseSpendLimit('read:data')   // null
+```
+
+---
+
+### `serializePayload(payload): string`
+
+Deterministically serializes a `CredentialPayload` (credential without signature)
+to a JSON string with keys sorted alphabetically. Used internally during issuance
+and verification. Exposed for advanced use cases (e.g. custom signing pipelines).
+
+---
+
+## Permission Scope System
+
+### Format
+
+Every scope is a string matching the pattern: `<category>:<resource_or_value>`
+
+- Lowercase letters, digits, hyphens, and underscores in both halves
+- The colon `:` is the separator
+- Custom scopes are fully supported — any well-formed string is valid
+- Examples: `read:data`, `spend:500`, `invoice:create`, `database:customers`
+
+### Standard Scopes (`SCOPES` constant)
+
+```typescript
+import { SCOPES } from '@cordprotocol/sdk';
+
+// Read group
+SCOPES.READ_DATA           = 'read:data'
+SCOPES.READ_MEMORY         = 'read:memory'
+SCOPES.READ_CONTEXT        = 'read:context'
+
+// Write group
+SCOPES.WRITE_DATA          = 'write:data'
+SCOPES.WRITE_ORDERS        = 'write:orders'
+SCOPES.WRITE_MESSAGES      = 'write:messages'
+
+// Execution group
+SCOPES.EXECUTE_CODE        = 'execute:code'
+SCOPES.EXECUTE_TOOLS       = 'execute:tools'
+
+// Communication group
+SCOPES.COMMUNICATE_EMAIL   = 'communicate:email'
+SCOPES.COMMUNICATE_API     = 'communicate:api'
+SCOPES.COMMUNICATE_WEBHOOK = 'communicate:webhook'
+```
+
+### Spend Scopes
+
+The `spend:` prefix is a convention for financial controls. The value after the
+colon is a dollar amount. Use `parseSpendLimit()` to extract the number.
+
+```typescript
+'spend:100'    // $100 spend cap
+'spend:500'    // $500 spend cap
+'spend:99.99'  // $99.99 spend cap (decimal supported)
+```
+
+There is no automatic enforcement of spend limits — the receiving service must
+check the scope and enforce the limit in its own logic.
+
+---
+
+## Credential Schema — All Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `string` | UUID v4 — unique per credential |
+| `agentId` | `string` | Caller-defined agent identifier (e.g. `"order-bot-v2"`) |
+| `issuedTo` | `string` | Owner/operator name (e.g. `"Acme Corp"`) |
+| `issuedAt` | `string` | ISO 8601 timestamp — when the credential was signed |
+| `expiresAt` | `string` | ISO 8601 timestamp — credential is invalid after this |
+| `permissions` | `string[]` | Scope strings listing what this agent may do |
+| `attestationHash` | `string` | Base64 SHA-256 of `attestationData` (or `id` if omitted) |
+| `issuerPublicKey` | `string` | Base64 Ed25519 public key of the signing authority |
+| `signature` | `string` | Base64 Ed25519 signature over all other fields |
+
+The signature covers the serialized payload (all fields except `signature` itself,
+JSON-serialized with keys sorted alphabetically). Any modification to any field
+invalidates the signature.
+
+---
+
+## Security Model
+
+### Why Ed25519?
+
+Ed25519 is a modern, high-performance elliptic curve signature scheme (Curve25519).
+It is used in TLS 1.3, SSH, Signal, and most modern security infrastructure.
+Key benefits:
+- 32-byte keys and signatures (compact for embedded credentials)
+- Fast: ~70,000 signatures/sec and ~20,000 verifications/sec on modern hardware
+- No parameter choices that can be misconfigured (unlike RSA)
+- Battle-tested: deployed at massive scale since 2011
+
+### Why Post-Quantum?
+
+Sufficiently powerful quantum computers running Shor's algorithm will break
+elliptic curve cryptography (ECDSA, Ed25519). NIST finalized post-quantum
+standards in 2024: FIPS 203 (Kyber/ML-KEM), FIPS 204 (Dilithium/ML-DSA),
+FIPS 205 (SPHINCS+/SLH-DSA).
+
+The threat is not immediate (large-scale quantum computers do not exist today),
+but "harvest now, decrypt later" attacks mean credentials issued today could
+theoretically be broken in the future.
+
+### The Dilithium Upgrade Path
+
+The SDK is architected for a seamless migration to CRYSTALS-Dilithium (ML-DSA):
+
+- `CryptoBackend` interface isolates all signing and verification
+- `generateKeyPair()` and `derivePublicKey()` in `crypto/keys.ts` are the only
+  algorithm-specific code
+- Credentials store keys and signatures as base64 strings — size differences
+  between Ed25519 (32 bytes) and Dilithium3 (1952/2420 bytes) are absorbed
+- When `@noble/post-quantum` reaches production maturity, **only two files change**:
+  `crypto/keys.ts` and `crypto/signatures.ts`. Zero consumer code changes.
+
+Plan a credential rotation window when migrating: existing Ed25519 credentials
+will not verify against a Dilithium backend.
+
+### What Ed25519 Provides
+
+- **Authentication:** The signature proves the credential was signed by the private
+  key corresponding to `issuerPublicKey`.
+- **Integrity:** Any modification to any field (including permissions, expiry,
+  agentId) breaks the signature.
+- **Non-repudiation:** The issuer cannot deny signing the credential.
+
+### What Ed25519 Does NOT Provide
+
+- **Confidentiality:** Credentials are plain JSON. Do not put secrets in them.
+- **Revocation:** Phase 1 has no revocation registry. Use short expiry windows.
+- **Anonymity:** `agentId` and `issuedTo` are in plaintext.
+
+### Security Best Practices
+
+- Store private keys in a secrets manager (HashiCorp Vault, AWS Secrets Manager,
+  GCP Secret Manager). Never log, commit, or transmit private keys.
+- Use short expiry windows: `"1h"` or `"8h"` rather than `"30d"`. Short-lived
+  credentials limit blast radius if stolen.
+- Hash agent configs into `attestationData` to bind credentials to specific code
+  versions.
+- Always call `verifyCredential()` — never trust a credential object without
+  verification.
+- Pass credentials in `X-Agent-Credential` or `Authorization: Bearer` headers,
+  not in URL parameters (URLs are logged).
+
+---
+
+## Transport
+
+Credentials are self-contained JSON. For transport, base64-encode the JSON:
+
+```typescript
+// Encode at the issuer / agent side
+const token = Buffer.from(JSON.stringify(credential)).toString('base64');
+
+// Decode and verify at the receiving service
+// (verifyCredential accepts base64 strings directly)
+const result = await verifyCredential(token);
+```
+
+Common transport patterns:
+- HTTP header: `X-Agent-Credential: <base64>`
+- Bearer token: `Authorization: Bearer <base64>`
+- Message queue: metadata field alongside message payload
+- Database: `TEXT` column on agent records
+- gRPC metadata: as a string metadata value
+
+---
+
+## CLI Reference
+
+The `cord` CLI is included in the package.
+
+```bash
+# Generate an Ed25519 key pair
+cord keygen
+# → prints publicKeyBase64 and privateKeyBase64
+
+# Issue a credential
+cord issue \
+  --agent-id "my-agent" \
+  --issued-to "Acme Corp" \
+  --permissions "read:data,write:orders,spend:500" \
+  --expires "24h" \
+  --private-key "<base64-private-key>" \
+  --attestation-data '{"model":"claude-sonnet-4-6","version":"1.0.0"}'
+# → prints base64 token and JSON
+
+# Verify a credential
+cord verify --credential "<base64-token>"
+# → prints VALID or INVALID with details
+# → exits 0 on valid, 1 on invalid
+```
+
+**`--expires` formats:** `30m`, `24h`, `7d`, `2w`, or an ISO 8601 timestamp.
+If `--private-key` is omitted from `issue`, a new key pair is generated and printed.
+
+---
+
+## Integration Examples
+
+### LangChain (TypeScript)
+
+Issue a credential when the agent is initialized. Attach it to outbound tool
+calls so downstream services can verify the agent identity.
+
+```typescript
+import { DynamicTool } from 'langchain/tools';
+import { ChatAnthropic } from '@langchain/anthropic';
+import { AgentExecutor, createReactAgent } from 'langchain/agents';
+import { generateKeyPair, issueCredential, SCOPES } from '@cordprotocol/sdk';
+
+// ── One-time issuer setup ─────────────────────────────────────────────────
+const issuerKeys = await generateKeyPair();
+// Store issuerKeys.privateKeyBase64 in your secrets manager
+
+// ── Issue credential for this agent instance ─────────────────────────────
+const credential = await issueCredential(
+  {
+    agentId: 'langchain-research-agent',
+    issuedTo: 'Acme Corp',
+    permissions: [SCOPES.READ_DATA, SCOPES.COMMUNICATE_API],
+    expiresIn: '8h',
+  },
+  issuerKeys.privateKeyBase64,
+);
+const credentialToken = Buffer.from(JSON.stringify(credential)).toString('base64');
+
+// ── Tool that carries the credential ─────────────────────────────────────
+const searchTool = new DynamicTool({
+  name: 'web_search',
+  description: 'Search for information.',
+  func: async (query: string) => {
+    const response = await fetch('https://api.acme.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Agent-Credential': credentialToken,
+      },
+      body: JSON.stringify({ query }),
+    });
+    if (!response.ok) throw new Error(`Search failed: ${response.status}`);
+    return JSON.stringify(await response.json());
+  },
+});
+
+// ── Build and run the agent ───────────────────────────────────────────────
+const llm = new ChatAnthropic({ model: 'claude-sonnet-4-6' });
+const agent = await createReactAgent({ llm, tools: [searchTool] });
+const executor = new AgentExecutor({ agent, tools: [searchTool] });
+
+const result = await executor.invoke({ input: 'What is the latest on quantum computing?' });
+```
+
+**At the receiving service (`api.acme.com`):**
+
+```typescript
+import { verifyCredential, hasPermission, SCOPES } from '@cordprotocol/sdk';
+
+app.post('/search', async (req, res) => {
+  const token = req.headers['x-agent-credential'] as string;
+  if (!token) return res.status(401).json({ error: 'Missing credential' });
+
+  const result = await verifyCredential(token);
+  if (!result.valid) return res.status(403).json({ error: result.errors });
+
+  if (!hasPermission(result.credential!, SCOPES.COMMUNICATE_API)) {
+    return res.status(403).json({ error: 'Agent lacks communicate:api scope' });
+  }
+
+  // Proceed with the search
+  const data = await performSearch(req.body.query);
+  res.json(data);
+});
+```
+
+---
+
+### AutoGen (Python + TypeScript bridge)
+
+AutoGen agents are Python-based. Issue credentials from a TypeScript service and
+pass them in the agent's system prompt or as environment variables. The agent
+includes the credential token in all outbound HTTP calls.
+
+```python
+# Python AutoGen agent
+import autogen
+import os
+
+# Credential token issued by your TypeScript issuer service
+AGENT_CREDENTIAL = os.environ['AGENT_CREDENTIAL_TOKEN']
+
+class CordAuthenticatedAgent(autogen.AssistantAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._credential = AGENT_CREDENTIAL
+
+    def call_api(self, endpoint: str, payload: dict) -> dict:
+        import requests
+        response = requests.post(
+            endpoint,
+            json=payload,
+            headers={'X-Agent-Credential': self._credential}
+        )
+        response.raise_for_status()
+        return response.json()
+
+agent = CordAuthenticatedAgent(
+    name='research_agent',
+    system_message='You are a research assistant. Always identify yourself with your credential.'
+)
+```
+
+---
+
+### CrewAI (Python)
+
+```python
+from crewai import Agent, Task, Crew
+from crewai.tools import BaseTool
+import requests
+import os
+
+CREDENTIAL_TOKEN = os.environ['CORD_AGENT_CREDENTIAL']
+
+class AuthenticatedAPITool(BaseTool):
+    name: str = "api_query"
+    description: str = "Query the company API with agent authentication."
+
+    def _run(self, query: str) -> str:
+        response = requests.post(
+            'https://api.acme.com/query',
+            json={'q': query},
+            headers={'X-Agent-Credential': CREDENTIAL_TOKEN}
+        )
+        return response.json()['result']
+
+research_agent = Agent(
+    role='Research Analyst',
+    goal='Gather accurate information',
+    tools=[AuthenticatedAPITool()],
+    verbose=True
+)
+
+task = Task(
+    description='Research quantum computing developments in 2025.',
+    agent=research_agent,
+    expected_output='A summary of key developments.'
+)
+
+crew = Crew(agents=[research_agent], tasks=[task])
+crew.kickoff()
+```
+
+---
+
+## FAQ
+
+### What is agent identity, and why does it matter?
+
+Agent identity is the ability to cryptographically prove: (1) which agent is
+making a request, (2) who authorized it, (3) what it is allowed to do, and (4)
+that this authorization has not been tampered with. Without it, services receiving
+requests from AI agents have no way to distinguish authorized actions from
+compromised or rogue agents.
+
+### How is this different from OAuth 2.0?
+
+OAuth requires a browser-based authorization flow: a user clicks "Allow", and the
+auth server issues a token. AI agents have no browser and no user to click anything.
+Additionally, OAuth tokens typically grant broad access to a resource (like "read
+your Google Drive"). Cord credentials carry an explicit, narrow permission list
+chosen at issue time. There is also no OAuth server to call at verification time —
+the issuer's public key is in the credential itself.
+
+### How is this different from API keys?
+
+API keys are long-lived, have no embedded metadata about what they authorize, and
+provide no cryptographic proof of identity. A stolen API key grants full access
+with no way to limit scope. Cord credentials expire (default 24h), carry an
+explicit scope list, and are signed — any modification is detectable.
+
+### Why post-quantum cryptography?
+
+Current AI agents can be secured with Ed25519 today. However, quantum computers
+running Shor's algorithm will eventually break elliptic curve cryptography.
+"Harvest now, decrypt later" attacks mean credentials intercepted today could
+theoretically be cracked in the future. The SDK is designed so the cryptographic
+backend is swappable with zero API changes, making migration to Dilithium
+(CRYSTALS-Dilithium / ML-DSA, NIST FIPS 204) a drop-in replacement.
+
+### Is this production ready?
+
+Phase 1 (current) is production-ready for credential issuance and verification.
+Two gaps to plan around: (1) there is no revocation registry — mitigate with
+short expiry windows (1h–8h); (2) Ed25519 is the only backend — Dilithium support
+is on the roadmap.
+
+### Can I use custom permission scopes?
+
+Yes. Any string matching `<lowercase-word>:<lowercase-word-or-number>` is a valid
+scope. The `SCOPES` constants are provided for convenience; you are not limited to
+them. Examples: `'invoice:create'`, `'database:customers'`, `'spend:250'`.
+
+### Does verification require calling the issuer?
+
+No. Verification is entirely local. The issuer's public key is embedded in the
+credential's `issuerPublicKey` field. `verifyCredential()` reconstructs the
+payload, checks expiry, and verifies the Ed25519 signature — all in-process with
+no network calls.
+
+### What happens if an agent tries to modify its credential?
+
+Any modification to any field — including permissions, expiry, agentId — changes
+the serialized payload and breaks the Ed25519 signature. `verifyCredential()` will
+return `valid: false` with the error `"Signature verification failed — credential
+may have been tampered with"`.
+
+### How should I handle credential renewal?
+
+Check `isExpired(credential)` before each significant action. When a credential
+is near expiry or expired, have the agent request a new one from the issuer service.
+Do not extend expiry by modifying the `expiresAt` field — that breaks the signature.
+Issue a fresh credential.
+
+---
+
+## Roadmap
+
+- **Phase 2:** Revocation registry (on-chain or off-chain) to support immediate
+  invalidation of compromised credentials
+- **Phase 3:** CRYSTALS-Dilithium (ML-DSA / NIST FIPS 204) as the default crypto
+  backend with Ed25519 as a legacy option
+- **Phase 4:** Hierarchical credential delegation — Agent A can issue sub-credentials
+  to Agent B with permissions that are a subset of A's own permissions
+- **Phase 5:** Agent registry and discovery — a public directory of verified agent
+  identities
+
+---
+
+## Package Info
+
+- **npm:** `@cordprotocol/sdk`
+- **License:** MIT
+- **Language:** TypeScript (ships compiled JS + `.d.ts`)
+- **Crypto:** `@noble/ed25519` (audited, zero-dependency)
+- **CLI:** `cord` (commander-based)
+- **Tests:** 38 passing (Vitest)
+- **Website:** https://cordprotocol.dev
